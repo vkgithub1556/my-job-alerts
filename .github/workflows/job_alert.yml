@@ -1,0 +1,64 @@
+name: Resume-Powered Job Alert
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # Runs at 00:00, 06:00, 12:00, 18:00 UTC every day
+  workflow_dispatch:          # Also adds a manual "Run workflow" button in GitHub UI
+
+jobs:
+  run-job-alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Restore seen_jobs.json from cache so we never re-send the same job
+      - name: Restore seen jobs cache
+        uses: actions/cache@v4
+        with:
+          path: seen_jobs.json
+          key: seen-jobs-${{ github.ref_name }}
+          restore-keys: seen-jobs-
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Cache pip packages to speed up future runs
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-v1
+
+      - name: Install Python dependencies
+        run: pip install apify-client openpyxl pypdf python-docx requests
+
+      - name: Run job alert script
+        env:
+          APIFY_API_TOKEN:    ${{ secrets.APIFY_API_TOKEN }}
+          GMAIL_ADDRESS:      ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL:    ${{ secrets.RECIPIENT_EMAIL }}
+        run: python job_alert_runner_v2.py
+
+      # Save updated seen_jobs.json back to cache after this run
+      - name: Save seen jobs cache
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: seen_jobs.json
+          key: seen-jobs-${{ github.ref_name }}-${{ github.run_number }}
+
+      # Keep Excel as a downloadable backup inside GitHub for 7 days
+      - name: Upload Excel as artifact backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: job-alert-${{ github.run_number }}
+          path: "*.xlsx"
+          retention-days: 7
+          if-no-files-found: ignore
