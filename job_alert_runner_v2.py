@@ -462,7 +462,8 @@ def scrape_jobs(search_queries):
     print(f"Source 1 - LinkedIn: {len(linkedin_urls)} searches")
     try:
         run = client.actor("curious_coder/linkedin-jobs-scraper").call(
-            run_input={"urls": linkedin_urls[:8], "count": 100, "scrapeCompany": False}
+            run_input={"urls": linkedin_urls[:8], "count": 100, "scrapeCompany": False},
+            timeout_secs=120,
         )
         for item in client.dataset(run["defaultDatasetId"]).iterate_items():
             job_id = str(item.get("id", ""))
@@ -569,13 +570,40 @@ def scrape_jobs(search_queries):
                         if key not in all_jobs:
                             # Normalize posted_date - Google uses relative strings like "2 days ago"
                             posted = job.get("posted_date", "") or ""
+
                             # Convert salary - may be a string or dict
                             sal = job.get("salary", "") or ""
                             if isinstance(sal, dict):
                                 sal = sal.get("salaryText", "") or ""
+
                             # Requirements list -> join to string for description enrichment
                             reqs = job.get("requirements", [])
                             reqs_text = " Requirements: " + " | ".join(reqs) if reqs else ""
+
+                            # --- LINK FIX ---
+                            # Google Jobs sometimes returns empty application_link.
+                            # Priority: application_link > apply_link > related_links[0] > Google search fallback
+                            direct_link = (
+                                job.get("application_link", "")
+                                or job.get("apply_link", "")
+                                or job.get("job_link", "")
+                                or job.get("url", "")
+                                or ""
+                            )
+                            # Try related_links list if present
+                            if not direct_link:
+                                related = job.get("related_links", []) or []
+                                if related and isinstance(related, list):
+                                    first = related[0]
+                                    direct_link = (
+                                        first.get("link", "") or first.get("url", "")
+                                        if isinstance(first, dict) else str(first)
+                                    )
+                            # Final fallback: Google Jobs search URL so user can find it manually
+                            if not direct_link:
+                                search_query = f"{title} {company}".replace(" ", "+")
+                                direct_link = f"https://www.google.com/search?q={search_query}&ibp=htl;jobs"
+
                             all_jobs[key] = {
                                 "id":              key,
                                 "title":           title,
@@ -584,7 +612,7 @@ def scrape_jobs(search_queries):
                                 "postedAt":        posted,
                                 "salary":          str(sal),
                                 "descriptionText": str(job.get("description", "")) + reqs_text,
-                                "link":            job.get("application_link", "") or "",
+                                "link":            direct_link,
                                 "source":          "Google Jobs",
                                 "employmentType":  str(job.get("job_type", "") or ""),
                             }
