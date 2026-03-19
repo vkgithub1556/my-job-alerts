@@ -2,7 +2,7 @@
 RESUME-POWERED JOB ALERT SYSTEM v2.0
 - Drop your resume (PDF or DOCX) into the /resumes folder
 - Script auto-reads it, extracts skills, builds search queries
-- Scrapes LinkedIn + Indeed every 6 hours via GitHub Actions
+- Scrapes LinkedIn + Indeed + Google Jobs every 6 hours via GitHub Actions
 - Emails you a 4-sheet Excel with ONLY NEW jobs each run
 - Never sends the same job twice (seen_jobs.json memory)
 
@@ -436,10 +436,20 @@ def score_job(job, profile):
 # SCRAPER - LinkedIn + Indeed via Apify
 # ============================================================
 def scrape_jobs(search_queries):
+    """
+    Scrapes jobs from 3 sources:
+      1. LinkedIn  - professional network, Canada + Alberta, past 24 hours
+      2. Indeed    - broad job board, Canada + Alberta, sorted by date
+      3. Google Jobs - meta-aggregator pulling from LinkedIn, Indeed, Glassdoor,
+                       company career pages, Workopolis, Monster, and 100s more
+    All results are merged and deduplicated by title+company key.
+    """
     client = ApifyClient(os.environ["APIFY_API_TOKEN"])
     all_jobs = {}
 
-    # Build LinkedIn URLs
+    # ----------------------------------------------------------
+    # SOURCE 1: LinkedIn
+    # ----------------------------------------------------------
     linkedin_urls = []
     for query in search_queries[:6]:
         encoded_query = query.replace(" ", "+")
@@ -449,7 +459,7 @@ def scrape_jobs(search_queries):
                    f"&f_TPR=r86400&position=1&pageNum=0")
             linkedin_urls.append(url)
 
-    print(f"LinkedIn: {len(linkedin_urls)} searches")
+    print(f"Source 1 - LinkedIn: {len(linkedin_urls)} searches")
     try:
         run = client.actor("curious_coder/linkedin-jobs-scraper").call(
             run_input={"urls": linkedin_urls[:8], "count": 100, "scrapeCompany": False}
@@ -459,12 +469,16 @@ def scrape_jobs(search_queries):
             if job_id and job_id not in all_jobs:
                 item["source"] = "LinkedIn"
                 all_jobs[job_id] = item
-        print(f"  LinkedIn total: {len(all_jobs)}")
+        print(f"  LinkedIn: {len(all_jobs)} jobs found")
     except Exception as e:
         print(f"  LinkedIn error: {e}")
 
-    # Indeed scrapes
-    print(f"Indeed: {len(search_queries[:4])} queries")
+    count_after_linkedin = len(all_jobs)
+
+    # ----------------------------------------------------------
+    # SOURCE 2: Indeed Canada
+    # ----------------------------------------------------------
+    print(f"Source 2 - Indeed: {len(search_queries[:4])} queries x 2 locations")
     for query in search_queries[:4]:
         for location in ["Alberta", "Canada"]:
             try:
@@ -504,7 +518,82 @@ def scrape_jobs(search_queries):
             except Exception as e:
                 print(f"  Indeed error ({query}/{location}): {e}")
 
-    print(f"Total scraped: {len(all_jobs)}")
+    count_after_indeed = len(all_jobs)
+    print(f"  Indeed: {count_after_indeed - count_after_linkedin} new jobs added")
+
+    # ----------------------------------------------------------
+    # SOURCE 3: Google Jobs
+    # Meta-aggregator: pulls from LinkedIn, Indeed, Glassdoor,
+    # company career pages, Workopolis, Monster, Eluta, and more.
+    # Input schema: query (str), location (str), country (str),
+    #               language (str), google_domain (str),
+    #               num_results (int), max_pagination (int)
+    # Output: list of dicts under key "jobs" inside each result item,
+    #         each job has: title, company_name, location, description,
+    #         salary, job_type, posted_date, application_link, requirements
+    # ----------------------------------------------------------
+    google_locations = [
+        ("Canada", "ca"),
+        ("Calgary, Alberta", "ca"),
+        ("Edmonton, Alberta", "ca"),
+    ]
+    print(f"Source 3 - Google Jobs: {len(search_queries[:5])} queries x {len(google_locations)} locations")
+    google_new = 0
+    for query in search_queries[:5]:
+        for location, country_code in google_locations:
+            try:
+                run = client.actor("johnvc/google-jobs-scraper").call(
+                    run_input={
+                        "query":         query,
+                        "location":      location,
+                        "country":       country_code,
+                        "language":      "en",
+                        "google_domain": "google.ca",
+                        "num_results":   50,
+                        "max_pagination": 3,
+                    }
+                )
+                for result_item in client.dataset(run["defaultDatasetId"]).iterate_items():
+                    # Google Jobs actor returns a wrapper object with a "jobs" list inside
+                    jobs_list = result_item.get("jobs", [])
+                    # Also handle flat format (some versions return jobs directly)
+                    if not jobs_list and result_item.get("title"):
+                        jobs_list = [result_item]
+
+                    for job in jobs_list:
+                        title   = job.get("title", "")
+                        company = job.get("company_name", "") or job.get("company", "")
+                        if not title:
+                            continue
+                        key = f"google_{title.lower().strip()}_{company.lower().strip()}"
+                        if key not in all_jobs:
+                            # Normalize posted_date - Google uses relative strings like "2 days ago"
+                            posted = job.get("posted_date", "") or ""
+                            # Convert salary - may be a string or dict
+                            sal = job.get("salary", "") or ""
+                            if isinstance(sal, dict):
+                                sal = sal.get("salaryText", "") or ""
+                            # Requirements list -> join to string for description enrichment
+                            reqs = job.get("requirements", [])
+                            reqs_text = " Requirements: " + " | ".join(reqs) if reqs else ""
+                            all_jobs[key] = {
+                                "id":              key,
+                                "title":           title,
+                                "companyName":     company,
+                                "location":        job.get("location", location),
+                                "postedAt":        posted,
+                                "salary":          str(sal),
+                                "descriptionText": str(job.get("description", "")) + reqs_text,
+                                "link":            job.get("application_link", "") or "",
+                                "source":          "Google Jobs",
+                                "employmentType":  str(job.get("job_type", "") or ""),
+                            }
+                            google_new += 1
+            except Exception as e:
+                print(f"  Google Jobs error ({query}/{location}): {e}")
+
+    print(f"  Google Jobs: {google_new} new jobs added")
+    print(f"Total unique jobs scraped (all 3 sources): {len(all_jobs)}")
     return list(all_jobs.values())
 
 
@@ -692,11 +781,12 @@ def build_excel(scored_jobs, profile, timestamp):
         ("Canada-Wide (non-Alberta)",            len(scored_jobs) - len(alberta_jobs)),
         ("From LinkedIn",                        sum(1 for j in scored_jobs if j.get("source") == "LinkedIn")),
         ("From Indeed",                          sum(1 for j in scored_jobs if j.get("source") == "Indeed")),
+        ("From Google Jobs",                     sum(1 for j in scored_jobs if j.get("source") == "Google Jobs")),
         ("Alert Generated",                      timestamp),
     ]
     stat_bg_colors = [
         DARK_NAVY, "1A7340", "2D6A2D", "7F6000", "8B3A0F", "5A0000",
-        "0A3D1F", "0A4D2A", "0A4D2A", "1E3A5F", "2E4A6F", "2E4A6F", "444444"
+        "0A3D1F", "0A4D2A", "0A4D2A", "1E3A5F", "2E4A6F", "2E4A6F", "1A3A6F", "444444"
     ]
 
     # Stats header
@@ -926,7 +1016,7 @@ def send_email(filepath, scored_jobs, profile):
           Excel attached with 4 sheets:
           All New Jobs | Alberta Only | Top Matches | Dashboard<br>
           Green rows in Excel = Alberta (Calgary / Edmonton) jobs<br>
-          Next alert in 6 hours.
+          Sources: LinkedIn, Indeed Canada, Google Jobs (aggregates 100+ boards) | Next alert in 6 hours.
           To update matching, replace your resume file in the /resumes folder on GitHub.
         </p>
       </div>
@@ -975,7 +1065,7 @@ if __name__ == "__main__":
     # Step 3: Build search queries from resume profile
     queries = build_search_queries(profile)
 
-    # Step 4: Scrape LinkedIn + Indeed
+    # Step 4: Scrape LinkedIn + Indeed + Google Jobs
     raw_jobs = scrape_jobs(queries)
 
     # Step 5: Filter to only new (never sent before) jobs
